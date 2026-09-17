@@ -1,0 +1,16 @@
+services:
+  feature-flag-api:
+    build: .
+    image: feature-flag-api:latest
+    container_name: feature-flag-api
+    ports:
+      - "8000:8000"
+    environment:
+      # 容器内固定路径，配合下方命名卷持久化
+      DATABASE_URL: sqlite:////app/data/flags.db
+    volumes:
+      - flag-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  flag-data:
