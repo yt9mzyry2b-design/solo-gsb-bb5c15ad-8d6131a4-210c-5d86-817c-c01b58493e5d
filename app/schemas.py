@@ -134,6 +134,17 @@ class SnapshotResponse(BaseModel):
     decided_at: Any
 
 
+class SnapshotListResponse(BaseModel):
+    """判定快照审计列表（游标分页）。
+
+    items 字段结构与单条查询的 SnapshotResponse 完全一致；
+    next_cursor 为不透明游标，无更多数据时为 null。
+    """
+
+    items: list[SnapshotResponse]
+    next_cursor: str | None
+
+
 class PreviewUser(BaseModel):
     """发布前影响预览的单个评估对象。"""
 

@@ -2,12 +2,14 @@
 
 import json
 from collections.abc import Sequence
+from datetime import datetime
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app import engine as eng
 from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion
+from app.pagination import DecisionFilters
 from app.schemas import FlagUpsertRequest, RuleIn, VariantIn
 
 
@@ -176,6 +178,67 @@ def save_snapshot(
 
 def get_snapshot(db: Session, request_id: str) -> DecisionSnapshot | None:
     return db.scalar(select(DecisionSnapshot).where(DecisionSnapshot.request_id == request_id))
+
+
+def list_snapshots(
+    db: Session,
+    filters: DecisionFilters,
+    *,
+    limit: int,
+    cursor_ts: datetime | None = None,
+    cursor_rid: str | None = None,
+) -> Sequence[DecisionSnapshot]:
+    """审计列表查询：组合过滤 + 键集分页。
+
+    固定按 ``(decided_at DESC, request_id DESC)`` 排序；游标给出上一页末行，
+    以严格“早于边界”的键集条件取下一页——翻页期间新写入的快照时间更晚，
+    自然不会进入后续页；同一 decided_at 由 request_id 决胜，不重不漏。
+    """
+    stmt = select(DecisionSnapshot)
+    if filters.flag_key is not None:
+        stmt = stmt.where(DecisionSnapshot.flag_key == filters.flag_key)
+    if filters.user_id is not None:
+        stmt = stmt.where(DecisionSnapshot.user_id == filters.user_id)
+    if filters.variant_key is not None:
+        stmt = stmt.where(DecisionSnapshot.variant_key == filters.variant_key)
+    if filters.decided_from is not None:
+        stmt = stmt.where(DecisionSnapshot.decided_at >= filters.decided_from)
+    if filters.decided_to is not None:
+        stmt = stmt.where(DecisionSnapshot.decided_at <= filters.decided_to)
+    if cursor_ts is not None:
+        stmt = stmt.where(
+            (DecisionSnapshot.decided_at < cursor_ts)
+            | (
+                (DecisionSnapshot.decided_at == cursor_ts)
+                & (DecisionSnapshot.request_id < cursor_rid)
+            )
+        )
+    stmt = stmt.order_by(
+        DecisionSnapshot.decided_at.desc(), DecisionSnapshot.request_id.desc()
+    ).limit(limit)
+    return db.scalars(stmt).all()
+
+
+# 审计列表所需的二级索引（名称须与 models.DecisionSnapshot.__table_args__ 一致）。
+# create_all 不会给已存在的旧表补索引，启动时用 IF NOT EXISTS 幂等创建，
+# 保证 Docker 卷中的历史库升级后也能直接使用，无需手工迁移。
+_SNAPSHOT_INDEXES_DDL = (
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_decided_at_request_id "
+    "ON decision_snapshots (decided_at, request_id)",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_flag_decided "
+    "ON decision_snapshots (flag_key, decided_at, request_id)",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_user_decided "
+    "ON decision_snapshots (user_id, decided_at, request_id)",
+    "CREATE INDEX IF NOT EXISTS ix_snapshots_variant_decided "
+    "ON decision_snapshots (variant_key, decided_at, request_id)",
+)
+
+
+def ensure_snapshot_indexes(db: Session) -> None:
+    """幂等补齐审计列表二级索引（兼容本功能上线前已有的数据库）。"""
+    for ddl in _SNAPSHOT_INDEXES_DDL:
+        db.execute(text(ddl))
+    db.commit()
 
 
 def count_snapshots(db: Session) -> int:

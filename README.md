@@ -11,7 +11,8 @@
 - 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
 - 每次创建 / 更新在**同一事务**中保存一份**不可变配置版本**，历史版本可查询、可指定用于判定；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
-- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**；
+- 提供判定快照**审计列表**（`GET /api/v1/decisions`）：多条件组合过滤 + 不透明游标分页，翻页期间新增快照不会串入后续页。
 
 ## 一条命令启动
 
@@ -50,6 +51,9 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
 
 # 3) 用返回的 request_id 查询判定快照
 curl -sS http://localhost:8000/api/v1/decisions/<request_id>
+
+# 4) 审计列表：按开关、用户、变体与时间窗组合过滤（游标分页）
+curl -sS "http://localhost:8000/api/v1/decisions?flag_key=new_checkout&user_id=user-1001&limit=20"
 ```
 
 ## API 一览
@@ -65,6 +69,7 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
+| `GET` | `/api/v1/decisions` | 判定快照审计列表（组合过滤 + 不透明游标分页） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -171,6 +176,59 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
 
 判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 或 `config_version` 不同），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
 
+### 判定快照审计列表
+
+`GET /api/v1/decisions` 与单条查询并存，用于审计 / 回溯历史判定。过滤参数可任意组合：
+
+| 参数 | 说明 |
+| --- | --- |
+| `flag_key` | 精确匹配开关 key |
+| `user_id` | 精确匹配用户 |
+| `variant_key` | 精确匹配最终变体 key |
+| `decided_from` | ISO-8601 时间（含），如 `2026-09-01T00:00:00Z` / `2026-09-01T08:00:00+08:00` |
+| `decided_to` | ISO-8601 时间（含）；早于 `decided_from` 返回 `422` |
+| `limit` | 每页条数，`1～100`，默认 `20` |
+| `cursor` | 上一页返回的不透明游标；首次请求不传 |
+
+```bash
+# 首页：某开关在 9 月的判定，每页 50 条
+curl -sS "http://localhost:8000/api/v1/decisions?flag_key=btn_color&decided_from=2026-09-01T00:00:00Z&decided_to=2026-10-01T00:00:00Z&limit=50"
+
+# 翻页：原样回传 next_cursor（过滤条件必须与首页一致，limit 可不同）
+curl -sS "http://localhost:8000/api/v1/decisions?flag_key=btn_color&decided_from=2026-09-01T00:00:00Z&decided_to=2026-10-01T00:00:00Z&limit=50&cursor=<next_cursor>"
+```
+
+响应固定按 `decided_at`、`request_id` **双字段倒序**：
+
+```json
+{
+  "items": [
+    {
+      "request_id": "7f7c0807-...",
+      "flag_key": "btn_color",
+      "user_id": "user-1001",
+      "request_context": {"region": "cn"},
+      "config_version": 1,
+      "bucket_value": null,
+      "matched_rule_index": 0,
+      "variant_key": "red",
+      "explanation": [ {"step": "rules_loaded", "detail": {}} ],
+      "decided_at": "2026-09-17T08:00:00.123456"
+    }
+  ],
+  "next_cursor": "eyJmIjp7..."
+}
+```
+
+分页约定：
+
+- `items` 每项结构与单条查询的 `SnapshotResponse` 完全一致；无更多数据时 `next_cursor` 为 `null`；
+- 游标为**不透明字符串**（base64url + 校验摘要），客户端只能原样回传，不应解析或自行构造；
+- 游标记录上一页最后一条的 `(decided_at, request_id)` 边界，并**绑定首次请求的全部过滤条件**：翻页时筛选条件不一致、游标损坏 / 篡改、时间区间倒置（`decided_from > decided_to`）均返回 `422`；
+- 同一 `decided_at` 由 `request_id` 决胜，键集分页保证**不重不漏**；
+- 游标只保存边界时刻，**翻页期间新写入的快照（时间晚于边界）不会进入后续页**；需要最新数据时不带游标重新从首页开始；
+- 升级后服务启动时会幂等补齐审计列表所需的组合索引（`decided_at, request_id` 及 flag/user/variant 前缀索引），Docker 卷中的历史库无需手工迁移。
+
 ### 发布前影响预览（只读）
 
 发布候选配置前，可用 `POST /api/v1/flags/{flag_key}/preview-impact` 评估影响：服务对请求中的每个用户分别用**当前线上版本**和**候选配置**做只读判定，仅返回结果发生变化的用户。
@@ -236,11 +294,12 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 ├── app/
 │   ├── main.py        # FastAPI 路由、错误处理、幂等、种子数据
 │   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
+│   ├── pagination.py  # 审计列表的不透明游标（边界 + 过滤条件绑定 + 校验摘要）
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
-│   ├── crud.py        # 配置、版本与快照持久化
+│   ├── crud.py        # 配置、版本与快照持久化（含审计列表查询与索引补齐）
 │   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（48 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（65 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

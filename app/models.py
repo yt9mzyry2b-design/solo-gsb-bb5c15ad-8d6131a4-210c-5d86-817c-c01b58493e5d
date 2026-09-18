@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -57,6 +57,14 @@ class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 
     __tablename__ = "decision_snapshots"
+    __table_args__ = (
+        # 列表审计：按 decided_at, request_id 倒序的键集分页主序索引
+        Index("ix_snapshots_decided_at_request_id", "decided_at", "request_id"),
+        # 常用等值过滤 + 倒序分页（indexed_column, decided_at, request_id 可由 SQLite 反向扫描）
+        Index("ix_snapshots_flag_decided", "flag_key", "decided_at", "request_id"),
+        Index("ix_snapshots_user_decided", "user_id", "decided_at", "request_id"),
+        Index("ix_snapshots_variant_decided", "variant_key", "decided_at", "request_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)

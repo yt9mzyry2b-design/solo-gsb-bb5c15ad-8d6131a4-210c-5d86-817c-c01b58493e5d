@@ -10,6 +10,7 @@
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
 - POST /api/v1/flags/{flag_key}/preview-impact  发布前候选配置影响预览（只读，不落版本与快照）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
+- GET  /api/v1/decisions          判定快照审计列表（组合过滤 + 不透明游标分页）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询判定快照
 - GET  /healthz                   健康检查
 """
@@ -17,8 +18,9 @@
 import json
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -28,6 +30,7 @@ from app import engine as eng
 from app.database import Base, engine, get_db
 from app.engine import RuleEvaluationError, decide
 from app.models import FlagConfig
+from app.pagination import DecisionFilters, InvalidCursor, decode_cursor, encode_cursor, normalize_dt
 from app.schemas import (
     EvaluateRequest,
     EvaluateResponse,
@@ -38,6 +41,7 @@ from app.schemas import (
     PreviewImpactRequest,
     PreviewImpactResponse,
     PreviewOutcome,
+    SnapshotListResponse,
 )
 
 
@@ -47,6 +51,8 @@ async def lifespan(app: FastAPI):
     db = next(get_db())
     try:
         crud.backfill_missing_versions(db)
+        # 历史库（如 Docker 卷中的旧版数据）不会被 create_all 补索引，这里幂等创建
+        crud.ensure_snapshot_indexes(db)
     finally:
         db.close()
     _seed_demo_flags()
@@ -174,6 +180,11 @@ def _decision_response(
 
 @app.exception_handler(RuleEvaluationError)
 async def rule_error_handler(request: Request, exc: RuleEvaluationError) -> JSONResponse:
+    return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": str(exc)})
+
+
+@app.exception_handler(InvalidCursor)
+async def invalid_cursor_handler(request: Request, exc: InvalidCursor) -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": str(exc)})
 
 
@@ -386,6 +397,62 @@ def preview_impact(
         changes=changes,
         migration_counts=migration,
     )
+
+
+@app.get("/api/v1/decisions", response_model=SnapshotListResponse)
+def list_decisions(
+    db: Session = Depends(get_db),
+    flag_key: str | None = Query(default=None, max_length=128),
+    user_id: str | None = Query(default=None, max_length=128),
+    variant_key: str | None = Query(default=None, max_length=128),
+    decided_from: datetime | None = Query(default=None),
+    decided_to: datetime | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+):
+    """判定快照审计列表：组合过滤 + 不透明游标分页。
+
+    - 过滤参数可任意组合；decided_from / decided_to 为 ISO-8601 时间、闭区间；
+    - 固定按 decided_at、request_id 双字段倒序，游标携带上一页末行边界，
+      同一时间戳由 request_id 决胜（不重不漏），翻页期间的新写入不会进入后续页；
+    - 游标与首次请求的过滤条件绑定：条件不一致、游标损坏均返回 422。
+    """
+    decided_from = normalize_dt(decided_from)
+    decided_to = normalize_dt(decided_to)
+    if decided_from is not None and decided_to is not None and decided_from > decided_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="decided_from 不得晚于 decided_to",
+        )
+
+    filters = DecisionFilters(
+        flag_key=flag_key,
+        user_id=user_id,
+        variant_key=variant_key,
+        decided_from=decided_from,
+        decided_to=decided_to,
+    )
+
+    cursor_ts = cursor_rid = None
+    if cursor is not None:
+        cursor_ts, cursor_rid = decode_cursor(cursor, filters)
+
+    # 多取一条判断是否还有下一页，但不把它暴露给调用方
+    rows = crud.list_snapshots(
+        db,
+        filters,
+        limit=limit + 1,
+        cursor_ts=cursor_ts,
+        cursor_rid=cursor_rid,
+    )
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = (
+        encode_cursor(page[-1].decided_at, page[-1].request_id, filters)
+        if has_more
+        else None
+    )
+    return {"items": [_snapshot_to_response(s) for s in page], "next_cursor": next_cursor}
 
 
 @app.get("/api/v1/decisions/{request_id}")
