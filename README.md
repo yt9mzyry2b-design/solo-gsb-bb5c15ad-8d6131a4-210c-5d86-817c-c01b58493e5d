@@ -65,7 +65,8 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 | `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中，可指定 `config_version`） |
 | `POST` | `/api/v1/flags/{flag_key}/preview-impact` | 发布前候选配置影响预览（只读，不写版本 / 快照） |
 | `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
-| `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
+| `GET` | `/api/v1/decisions` | 判定快照审计列表（组合过滤 + 不透明游标分页） |
+| `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询单条判定快照 |
 | `GET` | `/healthz` | 健康检查 |
 
 ### 创建开关
@@ -221,6 +222,59 @@ curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/preview-impact \
 - `current_version` 为当前线上版本，预览不会使版本号自增；
 - `migration_counts` 按“当前变体 → 候选变体”汇总迁移人数（仅统计变体发生变化的用户；变体不变、仅判定路径或命中规则变化的用户计入 `changed_users`，但不进入迁移计数）。
 
+### 判定快照审计列表（游标分页）
+
+`GET /api/v1/decisions` 与按 `request_id` 的单条查询并存，用于审计 / 回溯历史判定，支持以下查询参数组合过滤：
+
+| 参数 | 说明 |
+| --- | --- |
+| `flag_key` | 仅返回指定开关的快照 |
+| `user_id` | 仅返回指定用户的快照 |
+| `variant_key` | 仅返回命中指定变体的快照 |
+| `decided_from` | 判定时间下界（含），ISO 8601，如 `2026-09-17T00:00:00Z` |
+| `decided_to` | 判定时间上界（含），ISO 8601，支持 `+08:00` 偏移 |
+| `limit` | 每页条数，`1～100`，默认 `20` |
+| `cursor` | 上一页返回的不透明 `next_cursor` |
+
+结果按 `decided_at`、`request_id` 双列倒序返回（同一时间戳由 `request_id` 裁决，保证不重不漏）；响应项结构与单条查询的 `SnapshotResponse` 完全一致，无更多数据时 `next_cursor` 为 `null`。
+
+```bash
+# 首页：查 btn_color 在 9 月对 alice 的判定，每页 50 条
+curl -sS 'http://localhost:8000/api/v1/decisions?flag_key=btn_color&user_id=alice&decided_from=2026-09-01T00:00:00Z&decided_to=2026-10-01T00:00:00Z&limit=50'
+
+# 翻页：原样回传 next_cursor（过滤条件必须与首页完全一致，limit 可调整）
+curl -sS 'http://localhost:8000/api/v1/decisions?flag_key=btn_color&user_id=alice&decided_from=2026-09-01T00:00:00Z&decided_to=2026-10-01T00:00:00Z&limit=50&cursor=<next_cursor>'
+```
+
+响应示例：
+
+```json
+{
+  "items": [
+    {
+      "request_id": "7f7c0807-...",
+      "flag_key": "btn_color",
+      "user_id": "alice",
+      "request_context": {"region": "cn"},
+      "config_version": 1,
+      "bucket_value": null,
+      "matched_rule_index": 0,
+      "variant_key": "red",
+      "explanation": [ {"step": "rules_loaded", "detail": {}} ],
+      "decided_at": "2026-09-17T08:00:00.123456"
+    }
+  ],
+  "next_cursor": "eyJ2IjoxLi4ufQ.<hmac签名>"
+}
+```
+
+游标规则：
+
+- 游标**不透明且带 HMAC 签名**，只记录上一页边界（`decided_at` + `request_id`）、过滤条件与上界高水位，客户端不应解析或构造；
+- 翻页时过滤条件（`flag_key` / `user_id` / `variant_key` / `decided_from` / `decided_to`）必须与首页一致；**条件不一致、游标损坏或被篡改、时间区间倒置（from 晚于 to）一律返回 `422`**；
+- 首页请求发起时冻结高水位（最大快照 id），**翻页期间新写入的快照不会进入后续页**，页与页之间是一个稳定快照视图；重新从首页开始则能看到最新数据；
+- 服务重启后旧游标失效（按损坏处理，返回 `422`），重新取首页即可。
+
 ## 分桶算法
 
 ```
@@ -237,10 +291,11 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── main.py        # FastAPI 路由、错误处理、幂等、种子数据
 │   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
-│   ├── crud.py        # 配置、版本与快照持久化
+│   ├── cursor.py      # 审计列表的不透明签名游标（边界 + 过滤绑定 + 高水位）
+│   ├── crud.py        # 配置、版本与快照持久化（含分页查询与索引补齐）
 │   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（48 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（64 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

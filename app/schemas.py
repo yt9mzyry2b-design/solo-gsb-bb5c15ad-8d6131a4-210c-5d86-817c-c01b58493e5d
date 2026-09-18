@@ -134,6 +134,17 @@ class SnapshotResponse(BaseModel):
     decided_at: Any
 
 
+class DecisionListResponse(BaseModel):
+    """判定快照审计列表：不透明键集游标分页。
+
+    ``items`` 字段结构与 SnapshotResponse 完全一致，按
+    (decided_at DESC, request_id DESC) 排序；无更多数据时 ``next_cursor`` 为 null。
+    """
+
+    items: list[SnapshotResponse]
+    next_cursor: str | None = Field(description="下一页不透明游标；末页为 null")
+
+
 class PreviewUser(BaseModel):
     """发布前影响预览的单个评估对象。"""
 

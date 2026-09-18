@@ -10,25 +10,29 @@
 - POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
 - POST /api/v1/flags/{flag_key}/preview-impact  发布前候选配置影响预览（只读，不落版本与快照）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
-- GET  /api/v1/decisions/{request_id}     按 request_id 查询判定快照
+- GET  /api/v1/decisions          判定快照审计列表（不透明游标分页 + 组合过滤）
+- GET  /api/v1/decisions/{request_id}     按 request_id 查询单条判定快照
 - GET  /healthz                   健康检查
 """
 
 import json
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import crud
+from app import cursor as cursor_mod
 from app import engine as eng
 from app.database import Base, engine, get_db
 from app.engine import RuleEvaluationError, decide
 from app.models import FlagConfig
 from app.schemas import (
+    DecisionListResponse,
     EvaluateRequest,
     EvaluateResponse,
     FlagResponse,
@@ -47,6 +51,8 @@ async def lifespan(app: FastAPI):
     db = next(get_db())
     try:
         crud.backfill_missing_versions(db)
+        # 老库 create_all 不会追加新索引，显式幂等补齐
+        crud.ensure_decision_audit_indexes(db)
     finally:
         db.close()
     _seed_demo_flags()
@@ -385,6 +391,126 @@ def preview_impact(
         changed_users=len(changes),
         changes=changes,
         migration_counts=migration,
+    )
+
+
+@app.get(
+    "/api/v1/decisions",
+    response_model=DecisionListResponse,
+    summary="判定快照审计列表（不透明游标分页）",
+)
+def list_decisions(
+    flag_key: str | None = Query(default=None, max_length=128),
+    user_id: str | None = Query(default=None, max_length=128),
+    variant_key: str | None = Query(default=None, max_length=128),
+    decided_from: str | None = Query(default=None, description="判定时间下界（含），ISO 8601"),
+    decided_to: str | None = Query(default=None, description="判定时间上界（含），ISO 8601"),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None, description="上一页返回的不透明 next_cursor"),
+    db: Session = Depends(get_db),
+) -> DecisionListResponse:
+    """按 (decided_at DESC, request_id DESC) 键集游标分页返回判定快照。
+
+    - 支持 ``flag_key`` / ``user_id`` / ``variant_key`` 与
+      ``decided_from`` / ``decided_to`` 时间区间的组合过滤；
+    - ``limit`` 取 1～100，默认 20；
+    - 游标记录排序边界并绑定本次过滤条件：翻页时过滤条件必须与首页一致，
+      否则连同损坏游标、倒置时间区间一起返回 422；
+    - 以首页请求发起时全表最大自增 id 为上界高水位，翻页期间新写入的
+      快照不会进入后续页；
+    - 无更多数据时 ``next_cursor`` 为 ``null``。
+    """
+
+    def _parse_dt(name: str, raw: str) -> datetime:
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{name} 必须是 ISO 8601 时间，例如 2026-09-17T08:00:00Z",
+            ) from exc
+        # 统一成 naive UTC 比较，与 SQLAlchemy 从 SQLite 读出的 decided_at 形态一致
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    dt_from = _parse_dt("decided_from", decided_from) if decided_from is not None else None
+    dt_to = _parse_dt("decided_to", decided_to) if decided_to is not None else None
+    if dt_from is not None and dt_to is not None and dt_from > dt_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="时间区间倒置：decided_from 不得晚于 decided_to",
+        )
+
+    filters = cursor_mod.CursorFilter(
+        flag_key=flag_key,
+        user_id=user_id,
+        variant_key=variant_key,
+        decided_from=dt_from,
+        decided_to=dt_to,
+    )
+
+    boundary_ts = boundary_rid = None
+    max_id = None
+    if cursor is not None:
+        if not cursor:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="游标损坏或已失效"
+            )
+        try:
+            decoded = cursor_mod.decode_cursor(cursor)
+        except cursor_mod.InvalidCursor as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"游标损坏或已失效：{exc}"
+            ) from exc
+        # 游标绑定本次过滤条件：任一字段不一致即拒绝（时间按规范化后的 UTC 比较）
+        if decoded.filters != filters:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="游标与本次过滤条件不一致：翻页必须沿用首页的 flag_key/user_id/variant_key/decided_from/decided_to",
+            )
+        boundary_ts = decoded.boundary_ts
+        boundary_rid = decoded.boundary_request_id
+        max_id = decoded.watermark_id
+    else:
+        # 首页：在列表查询前冻结高水位，窗口固定为请求发起时已存在的行
+        max_id = crud.max_snapshot_id(db)
+
+    rows = list(
+        crud.list_snapshots(
+            db,
+            flag_key=flag_key,
+            user_id=user_id,
+            variant_key=variant_key,
+            decided_from=dt_from,
+            decided_to=dt_to,
+            limit=limit,
+            boundary_ts=boundary_ts,
+            boundary_request_id=boundary_rid,
+            max_id=max_id,
+        )
+    )
+
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    # 首页游标携带上面冻结的 hwm；后续页沿用游标中的 hwm，窗口不漂移。
+    # 翻页期间新写入快照的自增 id 必大于 hwm，被 id <= hwm 排除。
+
+    next_cursor = None
+    if has_more and page:
+        # 有行返回时 hwm 必然非空（首页前已冻结、后续页由游标携带）
+        assert max_id is not None
+        last = page[-1]
+        next_cursor = cursor_mod.encode_cursor(
+            boundary_ts=last.decided_at,
+            boundary_request_id=last.request_id,
+            watermark_id=max_id,
+            filters=filters,
+        )
+
+    return DecisionListResponse(
+        items=[_snapshot_to_response(snap) for snap in page],
+        next_cursor=next_cursor,
     )
 
 

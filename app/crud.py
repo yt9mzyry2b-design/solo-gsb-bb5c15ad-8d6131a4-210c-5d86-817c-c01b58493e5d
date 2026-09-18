@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Sequence
+from datetime import datetime
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -180,3 +181,88 @@ def get_snapshot(db: Session, request_id: str) -> DecisionSnapshot | None:
 
 def count_snapshots(db: Session) -> int:
     return db.scalar(select(func.count()).select_from(DecisionSnapshot)) or 0
+
+
+def max_snapshot_id(db: Session) -> int | None:
+    """返回当前最大自增 id（首页发起时的高水位）；空表返回 None。"""
+    return db.scalar(select(func.max(DecisionSnapshot.id)))
+
+
+def ensure_decision_audit_indexes(db: Session) -> None:
+    """为已存在的 decision_snapshots 表幂等补齐审计列表索引。
+
+    ``Base.metadata.create_all`` 只建新表、不会向老表追加新索引，
+    因此升级启动时显式执行 CREATE INDEX IF NOT EXISTS（SQLite 与
+    PostgreSQL 9.5+ 均支持），缺失才创建，已存在则为空操作。
+    """
+    from sqlalchemy import text
+
+    statements = (
+        "CREATE INDEX IF NOT EXISTS ix_decision_snapshots_decided_at_request_id "
+        "ON decision_snapshots (decided_at, request_id)",
+        "CREATE INDEX IF NOT EXISTS ix_decision_snapshots_flag_decided "
+        "ON decision_snapshots (flag_key, decided_at, request_id)",
+        "CREATE INDEX IF NOT EXISTS ix_decision_snapshots_user_decided "
+        "ON decision_snapshots (user_id, decided_at, request_id)",
+        "CREATE INDEX IF NOT EXISTS ix_decision_snapshots_variant_decided "
+        "ON decision_snapshots (variant_key, decided_at, request_id)",
+        "CREATE INDEX IF NOT EXISTS ix_decision_snapshots_flag_user_decided "
+        "ON decision_snapshots (flag_key, user_id, decided_at, request_id)",
+    )
+    for ddl in statements:
+        db.execute(text(ddl))
+    db.commit()
+
+
+def list_snapshots(
+    db: Session,
+    *,
+    flag_key: str | None = None,
+    user_id: str | None = None,
+    variant_key: str | None = None,
+    decided_from: datetime | None = None,
+    decided_to: datetime | None = None,
+    limit: int = 20,
+    # 键集边界：严格位于 (decided_at < boundary_ts) 或
+    # (decided_at == boundary_ts AND request_id < boundary_request_id)
+    boundary_ts: datetime | None = None,
+    boundary_request_id: str | None = None,
+    # 上界高水位（首页请求发起时全表最大自增 id）：翻页期间新写入
+    # 快照的 id 更大，一律被 id <= max_id 排除，保证翻页窗口不漂移、不重不漏。
+    max_id: int | None = None,
+) -> Sequence[DecisionSnapshot]:
+    """按 (decided_at DESC, request_id DESC) 键集分页查询判定快照。
+
+    多取 1 行（limit + 1）用于判断是否还有下一页；同一 decided_at 用
+    request_id 做唯一并列裁决，保证同一时间戳不重不漏。
+    """
+    stmt = select(DecisionSnapshot)
+
+    if flag_key is not None:
+        stmt = stmt.where(DecisionSnapshot.flag_key == flag_key)
+    if user_id is not None:
+        stmt = stmt.where(DecisionSnapshot.user_id == user_id)
+    if variant_key is not None:
+        stmt = stmt.where(DecisionSnapshot.variant_key == variant_key)
+    if decided_from is not None:
+        stmt = stmt.where(DecisionSnapshot.decided_at >= decided_from)
+    if decided_to is not None:
+        stmt = stmt.where(DecisionSnapshot.decided_at <= decided_to)
+
+    if boundary_ts is not None:
+        # 必须携带成对的 request_id（游标保证）
+        stmt = stmt.where(
+            (DecisionSnapshot.decided_at < boundary_ts)
+            | (
+                (DecisionSnapshot.decided_at == boundary_ts)
+                & (DecisionSnapshot.request_id < boundary_request_id)
+            )
+        )
+
+    if max_id is not None:
+        stmt = stmt.where(DecisionSnapshot.id <= max_id)
+
+    stmt = stmt.order_by(
+        DecisionSnapshot.decided_at.desc(), DecisionSnapshot.request_id.desc()
+    ).limit(limit + 1)
+    return db.scalars(stmt).all()

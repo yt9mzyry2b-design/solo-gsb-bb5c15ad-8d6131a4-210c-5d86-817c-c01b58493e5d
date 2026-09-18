@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -57,6 +57,21 @@ class DecisionSnapshot(Base):
     """一次判定请求的完整快照，可按 request_id 回查。"""
 
     __tablename__ = "decision_snapshots"
+    __table_args__ = (
+        # 审计列表：(decided_at, request_id) 倒序键集分页
+        Index("ix_decision_snapshots_decided_at_request_id", "decided_at", "request_id"),
+        # 组合过滤 + 同一倒序键集分页
+        Index("ix_decision_snapshots_flag_decided", "flag_key", "decided_at", "request_id"),
+        Index("ix_decision_snapshots_user_decided", "user_id", "decided_at", "request_id"),
+        Index("ix_decision_snapshots_variant_decided", "variant_key", "decided_at", "request_id"),
+        Index(
+            "ix_decision_snapshots_flag_user_decided",
+            "flag_key",
+            "user_id",
+            "decided_at",
+            "request_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     request_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
@@ -68,4 +83,4 @@ class DecisionSnapshot(Base):
     matched_rule_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     variant_key: Mapped[str] = mapped_column(String(128), nullable=False)
     explanation_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
-    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
